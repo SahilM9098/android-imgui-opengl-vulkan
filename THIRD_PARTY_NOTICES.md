@@ -11,7 +11,7 @@ This repository includes third-party code and assets. The project license applie
 
 ## stb single-file libraries
 
-- Paths: `app/src/main/cpp/ImGui/imstb_*.h`
+- Paths: `app/src/main/cpp/ImGui/imstb_*.h`, `app/src/main/cpp/ImGui/stb_image.h`
 - Source: https://github.com/nothings/stb
 - License: MIT or Public Domain, at your option.
 - Copyright: Copyright (c) 2017 Sean Barrett.

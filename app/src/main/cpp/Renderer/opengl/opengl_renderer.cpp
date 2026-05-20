@@ -1,4 +1,7 @@
 #include "opengl_renderer.hpp"
+#include "image_texture.hpp"
+#include "imgui_fonts.hpp"
+#include "log_config.hpp"
 #include "renderer.hpp"
 
 #include <EGL/egl.h>
@@ -12,8 +15,8 @@
 #include "dobby.h"
 
 #define LOG_TAG "OpenGLRenderer"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) DRI_LOG_PRINT(DRI_LOG_OPENGL_RENDERER, ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) DRI_LOG_PRINT(DRI_LOG_OPENGL_RENDERER, ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace Renderer {
 namespace OpenGL {
@@ -24,6 +27,12 @@ namespace OpenGL {
     static int g_ScreenWidth = 0;
     static int g_ScreenHeight = 0;
     static DrawCallback g_DrawCallback = nullptr;
+    static EGLContext g_CurrentContext = EGL_NO_CONTEXT;
+    static EGLSurface g_CurrentSurface = EGL_NO_SURFACE;
+    static EGLContext g_PendingContext = EGL_NO_CONTEXT;
+    static EGLSurface g_PendingSurface = EGL_NO_SURFACE;
+    static int g_StableSwapCount = 0;
+    static constexpr int kRequiredStableSwaps = 2;
 
     // Original function pointer
     static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay display, EGLSurface surface) = nullptr;
@@ -45,10 +54,29 @@ namespace OpenGL {
         return orig_eglCreateWindowSurface(display, config, window, attrib_list);
     }
 
+    static void DestroyImGuiContext(const char* reason) {
+        if (!g_Initialized) {
+            g_CurrentContext = EGL_NO_CONTEXT;
+            g_CurrentSurface = EGL_NO_SURFACE;
+            return;
+        }
+
+        LOGI("Destroying ImGui OpenGL ES context: %s", reason ? reason : "unknown");
+        ImGui_ImplOpenGL3_Shutdown();
+        Renderer::Images::OnImGuiContextDestroyed();
+        ImGui::DestroyContext();
+        g_Initialized = false;
+        g_CurrentContext = EGL_NO_CONTEXT;
+        g_CurrentSurface = EGL_NO_SURFACE;
+    }
+
     static void SetupImGui() {
         if (g_Initialized) return;
 
         LOGI("Setting up ImGui for OpenGL ES...");
+
+        g_CurrentContext = eglGetCurrentContext();
+        g_CurrentSurface = eglGetCurrentSurface(EGL_DRAW);
 
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
@@ -56,6 +84,7 @@ namespace OpenGL {
         ImGuiIO& io = ImGui::GetIO();
         io.DisplaySize = ImVec2((float)g_ScreenWidth, (float)g_ScreenHeight);
         io.IniFilename = nullptr;
+        Renderer::SetupImGuiFonts();
 
         // Configure style
         ImGui::StyleColorsDark();
@@ -85,16 +114,66 @@ namespace OpenGL {
         if (g_DrawCallback) {
             g_DrawCallback();
         }
+        Renderer::UpdateInputCaptureState();
 
         ImGui::EndFrame();
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        Renderer::Images::UpdateLifecycle();
+    }
+
+    static bool QuerySurfaceSize(EGLDisplay display, EGLSurface surface, int& width, int& height) {
+        EGLint eglWidth = 0;
+        EGLint eglHeight = 0;
+        if (!eglQuerySurface(display, surface, EGL_WIDTH, &eglWidth) ||
+            !eglQuerySurface(display, surface, EGL_HEIGHT, &eglHeight) ||
+            eglWidth <= 0 || eglHeight <= 0) {
+            return false;
+        }
+
+        width = eglWidth;
+        height = eglHeight;
+        return true;
+    }
+
+    static bool IsStableSwapTarget(EGLContext ctx, EGLSurface surface) {
+        if (ctx == g_PendingContext && surface == g_PendingSurface) {
+            ++g_StableSwapCount;
+        } else {
+            g_PendingContext = ctx;
+            g_PendingSurface = surface;
+            g_StableSwapCount = 1;
+        }
+
+        return g_StableSwapCount >= kRequiredStableSwaps;
     }
 
     // Hooked eglSwapBuffers
     static EGLBoolean hook_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
+        EGLContext ctx = eglGetCurrentContext();
+        EGLSurface drawSurface = eglGetCurrentSurface(EGL_DRAW);
+        if (ctx == EGL_NO_CONTEXT || drawSurface == EGL_NO_SURFACE || drawSurface != surface) {
+            return orig_eglSwapBuffers(display, surface);
+        }
+
+        int width = 0;
+        int height = 0;
+        if (!QuerySurfaceSize(display, surface, width, height)) {
+            return orig_eglSwapBuffers(display, surface);
+        }
+
+        if (g_Initialized && (ctx != g_CurrentContext || surface != g_CurrentSurface)) {
+            LOGI("Detected EGL target change ctx %p->%p surface %p->%p. Re-initializing ImGui...",
+                 g_CurrentContext, ctx, g_CurrentSurface, surface);
+            DestroyImGuiContext("EGL target changed");
+        }
+
         // First call: try to claim as the active renderer
         if (!g_Claimed) {
+            if (!IsStableSwapTarget(ctx, surface)) {
+                return orig_eglSwapBuffers(display, surface);
+            }
+
             if (Renderer::ClaimAPI(API::OPENGL_ES)) {
                 g_Claimed = true;
                 LOGI("eglSwapBuffers called! OpenGL ES is the active API.");
@@ -109,15 +188,10 @@ namespace OpenGL {
             return orig_eglSwapBuffers(display, surface);
         }
 
-        // Query surface dimensions
-        EGLint width = 0, height = 0;
-        eglQuerySurface(display, surface, EGL_WIDTH, &width);
-        eglQuerySurface(display, surface, EGL_HEIGHT, &height);
+        Renderer::OnFrameRendered(API::OPENGL_ES);
 
-        if (width > 0 && height > 0) {
-            g_ScreenWidth = width;
-            g_ScreenHeight = height;
-        }
+        g_ScreenWidth = width;
+        g_ScreenHeight = height;
 
         // Initialize ImGui on first valid frame
         if (!g_Initialized && g_ScreenWidth > 0 && g_ScreenHeight > 0) {
@@ -172,11 +246,10 @@ namespace OpenGL {
     }
 
     void Shutdown() {
-        if (g_Initialized) {
-            ImGui_ImplOpenGL3_Shutdown();
-            ImGui::DestroyContext();
-            g_Initialized = false;
-        }
+        DestroyImGuiContext("OpenGL renderer shutdown");
+        g_PendingContext = EGL_NO_CONTEXT;
+        g_PendingSurface = EGL_NO_SURFACE;
+        g_StableSwapCount = 0;
 
         if (orig_eglSwapBuffers) {
             void* egl_handle = dlopen("libEGL.so", RTLD_LAZY);

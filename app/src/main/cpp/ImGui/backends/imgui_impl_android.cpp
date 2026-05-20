@@ -32,16 +32,19 @@
 #include "imgui.h"
 #ifndef IMGUI_DISABLE
 #include "imgui_impl_android.h"
+#include "log_config.hpp"
 #include <time.h>
 #include <android/native_window.h>
 #include <android/input.h>
 #include <android/keycodes.h>
 #include <android/log.h>
 
+#define LOG_TAG "ImGuiAndroidBackend"
+#define LOGD(...) DRI_LOG_PRINT(DRI_LOG_IMGUI_ANDROID_BACKEND, ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+
 // Android data
 static double                                   g_Time = 0.0;
 static ANativeWindow*                           g_Window;
-static char                                     g_LogTag[] = "ImGuiExample";
 static int32_t                                  g_LastLoggedWindowWidth = -1;
 static int32_t                                  g_LastLoggedWindowHeight = -1;
 static float                                    g_LastLoggedDisplayWidth = -1.0f;
@@ -321,11 +324,10 @@ void ImGui_ImplAndroid_NewFrame()
         || g_LastLoggedDisplayWidth != io.DisplaySize.x
         || g_LastLoggedDisplayHeight != io.DisplaySize.y)
     {
-        __android_log_print(ANDROID_LOG_DEBUG, "ArkModMenuNative",
-                            "imgui newFrame nativeWindow=%dx%d ioDisplay=%.1fx%.1f fbScale=%.3fx%.3f",
-                            window_width, window_height,
-                            io.DisplaySize.x, io.DisplaySize.y,
-                            io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
+        LOGD("imgui newFrame nativeWindow=%dx%d ioDisplay=%.1fx%.1f fbScale=%.3fx%.3f",
+             window_width, window_height,
+             io.DisplaySize.x, io.DisplaySize.y,
+             io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
         g_LastLoggedWindowWidth = window_width;
         g_LastLoggedWindowHeight = window_height;
         g_LastLoggedDisplayWidth = io.DisplaySize.x;

@@ -1,98 +1,51 @@
 #include <jni.h>
-#include <string>
-#include <thread>
-#include <unistd.h>
 #include <android/log.h>
-#include <android/input.h>
-#include <dlfcn.h>
-#include <atomic>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <cerrno>
+#include <cstdio>
+#include <string>
+#include <unistd.h>
 
 #include "imgui.h"
+#include "Renderer/log_config.hpp"
 #include "Renderer/renderer.hpp"
-#include "dobby.h"
+#include "Renderer/input/input_handler.hpp"
+#include "image_texture.hpp"
 
 #define LOG_TAG "DualRenderImGui"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) DRI_LOG_PRINT(DRI_LOG_DUAL_RENDER_IMGUI, ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) DRI_LOG_PRINT(DRI_LOG_DUAL_RENDER_IMGUI, ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ─── Menu State ──────────────────────────────────────────────────────────────────
 
 static bool g_ShowMenu = true;
 
-// ─── Native Input Hook ──────────────────────────────────────────────────────────
-
-using AInputQueue_getEvent_t = int32_t (*)(AInputQueue*, AInputEvent**);
-static AInputQueue_getEvent_t orig_AInputQueue_getEvent = nullptr;
-static std::atomic<int> g_InputLogCount{0};
-
-static void QueueMotionEvent(const AInputEvent* event) {
-    if (!event || AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION)
-        return;
-
-    int32_t rawAction = AMotionEvent_getAction(event);
-    int32_t pointerIndex = (rawAction & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
-    int32_t action = rawAction & AMOTION_EVENT_ACTION_MASK;
-
-    if (pointerIndex < 0 || (size_t)pointerIndex >= AMotionEvent_getPointerCount(event))
-        pointerIndex = 0;
-
-    float x = AMotionEvent_getX(event, pointerIndex);
-    float y = AMotionEvent_getY(event, pointerIndex);
-
-    switch (action) {
-        case AMOTION_EVENT_ACTION_DOWN:
-            Renderer::HandleTouch(0, x, y);
-            break;
-        case AMOTION_EVENT_ACTION_UP:
-        case AMOTION_EVENT_ACTION_CANCEL:
-            Renderer::HandleTouch(1, x, y);
-            break;
-        case AMOTION_EVENT_ACTION_MOVE:
-        case AMOTION_EVENT_ACTION_HOVER_MOVE:
-            Renderer::HandleTouch(2, AMotionEvent_getX(event, 0), AMotionEvent_getY(event, 0));
-            break;
-        default:
-            break;
-    }
-
-    int logCount = g_InputLogCount.fetch_add(1);
-    if (logCount < 12) {
-        LOGI("Input event action=%d pointer=%d x=%.1f y=%.1f", action, pointerIndex, x, y);
-    }
-}
-
-static int32_t hook_AInputQueue_getEvent(AInputQueue* queue, AInputEvent** outEvent) {
-    int32_t result = orig_AInputQueue_getEvent(queue, outEvent);
-    if (result >= 0 && outEvent && *outEvent)
-        QueueMotionEvent(*outEvent);
-    return result;
-}
-
-static void InstallInputHooks() {
-    void* libandroid = dlopen("libandroid.so", RTLD_NOW);
-    if (!libandroid) {
-        LOGE("Failed to open libandroid.so for input hook: %s", dlerror());
-        return;
-    }
-
-    void* getEvent = dlsym(libandroid, "AInputQueue_getEvent");
-    if (!getEvent) {
-        LOGE("Failed to resolve AInputQueue_getEvent");
-        return;
-    }
-
-    if (DobbyHook(getEvent, (void*)hook_AInputQueue_getEvent,
-                  (void**)&orig_AInputQueue_getEvent) != 0) {
-        LOGE("Failed to hook AInputQueue_getEvent at %p", getEvent);
-        return;
-    }
-
-    LOGI("AInputQueue_getEvent hooked for ImGui touch input");
-}
-
 // ─── ImGui Draw Callback ─────────────────────────────────────────────────────────
 // This is where you put your ImGui UI code.
 // It gets called every frame by the renderer.
+
+std::string ReadPackageName() {
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) {
+        return {};
+    }
+
+    char buffer[256] = {};
+    ssize_t count = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (count <= 0) {
+        return {};
+    }
+
+    std::string package(buffer);
+    const size_t process_suffix = package.find(':');
+    if (process_suffix != std::string::npos) {
+        package.resize(process_suffix);
+    }
+    return package;
+}
 
 static void DrawMenu() {
     if (!g_ShowMenu) return;
@@ -126,26 +79,41 @@ static void DrawMenu() {
         ImGui::Text("ImGui v%s", ImGui::GetVersion());
     }
 
+    static Renderer::Images::Texture logo;
+    static bool logoLoadTried = false;
+
+    if (!logoLoadTried) {
+        logoLoadTried = true;
+        std::string path = "/sdcard/Android/media/" + ReadPackageName() + "/logo.jpg";
+        const bool loaded = Renderer::Images::LoadFromFile(path.c_str(), &logo);
+        if (loaded) {
+            LOGI("Loaded logo from file: %s", path.c_str());
+        } else {
+            LOGE("Failed to load logo from file: %s | %s", path.c_str(), Renderer::Images::GetLastError());
+        }
+    }
+
+    if (logo.IsValid()) {
+        Renderer::Images::Render(logo, ImVec2(180.0f, 180.0f));
+    }
+
+
+
+
     ImGui::End();
 }
 
 // ─── Initialization Thread ───────────────────────────────────────────────────────
-// Runs in background, waits for the game to load its graphics library,
-// then initializes the renderer hooks.
+// Runs in background and initializes graphics/input hooks.
 
 static void* InitThread(void*) {
     LOGI("Init thread started, hooking immediately (no delay)...");
 
-    // NO SLEEP - hook immediately so we catch vkCreateDevice/vkCreateSwapchainKHR
-    // before the game calls them. The bootstrap already handles timing.
-
-    // Initialize the universal renderer (hooks both OpenGL ES and Vulkan, first call wins)
     if (Renderer::Init()) {
-        LOGI("Renderer hooks installed, waiting for game to render...");
+        LOGI("Graphics hooks installed, waiting for render frames...");
 
-        // Set our draw callback
         Renderer::SetDrawCallback(DrawMenu);
-        InstallInputHooks();
+        Renderer::Input::Init();
     } else {
         LOGE("Failed to install any renderer hooks!");
     }

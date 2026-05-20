@@ -3,9 +3,9 @@
 /**
  * Universal ImGui Renderer
  * 
- * Hooks BOTH eglSwapBuffers AND Vulkan present simultaneously.
- * Whichever hook gets CALLED first by the game wins and becomes
- * the active renderer. The other becomes a passthrough.
+ * By default, hooks BOTH eglSwapBuffers AND Vulkan present simultaneously.
+ * Whichever hook gets CALLED first wins and becomes the active renderer.
+ * You can force one graphics backend in renderer_config.hpp.
  * 
  * This solves the problem where libEGL.so is always loaded on Android
  * even in Vulkan-only games (hooking succeeds but never fires).
@@ -25,7 +25,7 @@ namespace Renderer {
     // Callback type for user draw logic
     using DrawCallback = std::function<void()>;
 
-    // Initialize the renderer - hooks both APIs, first call wins
+    // Initialize graphics hooks according to renderer_config.hpp.
     bool Init();
 
     // Shutdown and unhook everything
@@ -40,6 +40,9 @@ namespace Renderer {
     // Race condition resolver - called by whichever hook fires first
     bool ClaimAPI(API api);
 
+    // Track frame present heartbeat for each API
+    void OnFrameRendered(API api);
+
     // Get screen dimensions
     int GetScreenWidth();
     int GetScreenHeight();
@@ -52,6 +55,13 @@ namespace Renderer {
 
     // Drains queued touch events into the current ImGui context on the render thread.
     void DrainInputEvents();
+
+    // Publishes current ImGui input hit regions from the render thread.
+    void UpdateInputCaptureState();
+
+    // Returns true when the touch should be consumed by the overlay instead of
+    // being forwarded to the target application.
+    bool ShouldConsumeTouch(int action, float x, float y);
 
     // Check if ImGui wants to capture input
     bool WantsCaptureInput();

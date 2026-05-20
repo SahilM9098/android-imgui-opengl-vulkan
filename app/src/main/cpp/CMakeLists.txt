@@ -15,6 +15,8 @@ include_directories(${CMAKE_SOURCE_DIR}/ImGui/backends)
 include_directories(${CMAKE_SOURCE_DIR}/Dobby)
 include_directories(${CMAKE_SOURCE_DIR}/Font)
 include_directories(${CMAKE_SOURCE_DIR}/Renderer)
+include_directories(${CMAKE_SOURCE_DIR}/Renderer/images)
+include_directories(${CMAKE_SOURCE_DIR}/Renderer/input)
 include_directories(${CMAKE_SOURCE_DIR}/Renderer/opengl)
 include_directories(${CMAKE_SOURCE_DIR}/Renderer/vulkan)
 
@@ -36,7 +38,10 @@ set(IMGUI_BACKEND_SOURCES
 # ─── Renderer sources ────────────────────────────────────────────────────────────
 
 set(RENDERER_SOURCES
+        Renderer/imgui_fonts.cpp
+        Renderer/images/image_texture.cpp
         Renderer/renderer.cpp
+        Renderer/input/input_handler.cpp
         Renderer/opengl/opengl_renderer.cpp
         Renderer/vulkan/vulkan_renderer.cpp)
 

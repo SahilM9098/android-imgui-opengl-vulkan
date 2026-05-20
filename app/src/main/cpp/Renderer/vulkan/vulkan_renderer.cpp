@@ -1,4 +1,7 @@
 #include "vulkan_renderer.hpp"
+#include "image_texture.hpp"
+#include "imgui_fonts.hpp"
+#include "log_config.hpp"
 #include "renderer.hpp"
 
 #include <vulkan/vulkan.h>
@@ -21,14 +24,15 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstdio>
+#include <algorithm>
 
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "dobby.h"
 
 #define LOG_TAG "VulkanRenderer"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) DRI_LOG_PRINT(DRI_LOG_VULKAN_RENDERER, ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) DRI_LOG_PRINT(DRI_LOG_VULKAN_RENDERER, ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace Renderer {
 namespace Vulkan {
@@ -52,6 +56,12 @@ namespace Vulkan {
     static VkSwapchainKHR g_Swapchain = VK_NULL_HANDLE;
     static VkFormat g_SwapchainFormat = VK_FORMAT_UNDEFINED;
     static VkExtent2D g_SwapchainExtent = {0, 0};
+    static VkSurfaceTransformFlagBitsKHR g_SwapchainTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    static int g_SurfaceWidth = 0;
+    static int g_SurfaceHeight = 0;
+    static int g_DisplayWidth = 0;
+    static int g_DisplayHeight = 0;
+    static bool g_TransformLogged = false;
     static std::vector<VkImage> g_SwapchainImages;
     static std::vector<VkImageView> g_SwapchainImageViews;
     static std::vector<VkFramebuffer> g_Framebuffers;
@@ -92,8 +102,157 @@ namespace Vulkan {
     static VkResult hook_vkAcquireNextImage2KHR(VkDevice, const VkAcquireNextImageInfoKHR*, uint32_t*);
     static VkResult hook_vkQueuePresentKHR(VkQueue, const VkPresentInfoKHR*);
     static void* hook_dlsym(void*, const char*);
+    static int HookLoadedLibraryGotSymbols(void* replacementGipa, void** originalGipa,
+                                           void* replacementGdpa, void** originalGdpa);
 
     static bool TrySetupImGui();
+
+    enum class DisplayTransform {
+        Identity,
+        Rotate90,
+        Rotate180,
+        Rotate270
+    };
+
+    static const char* TransformName(DisplayTransform transform) {
+        switch (transform) {
+            case DisplayTransform::Rotate90: return "rotate90";
+            case DisplayTransform::Rotate180: return "rotate180";
+            case DisplayTransform::Rotate270: return "rotate270";
+            default: return "identity";
+        }
+    }
+
+    static DisplayTransform GetDisplayTransform() {
+        switch (g_SwapchainTransform) {
+            case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
+                return DisplayTransform::Rotate90;
+            case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+                return DisplayTransform::Rotate180;
+            case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR:
+                return DisplayTransform::Rotate270;
+            default:
+                break;
+        }
+
+        if (g_SurfaceWidth > 0 && g_SurfaceHeight > 0 &&
+            g_SwapchainExtent.width > 0 && g_SwapchainExtent.height > 0) {
+            const bool surfaceLandscape = g_SurfaceWidth > g_SurfaceHeight;
+            const bool swapchainLandscape = g_SwapchainExtent.width > g_SwapchainExtent.height;
+            if (surfaceLandscape != swapchainLandscape)
+                return surfaceLandscape ? DisplayTransform::Rotate90 : DisplayTransform::Rotate270;
+        }
+
+        return DisplayTransform::Identity;
+    }
+
+    static void UpdateDisplayGeometry() {
+        int width = (int)g_SwapchainExtent.width;
+        int height = (int)g_SwapchainExtent.height;
+        const DisplayTransform transform = GetDisplayTransform();
+
+        if (g_SurfaceWidth > 0 && g_SurfaceHeight > 0) {
+            const bool rotated = transform == DisplayTransform::Rotate90 ||
+                                 transform == DisplayTransform::Rotate270;
+            const bool orientationMismatch =
+                    (g_SurfaceWidth > g_SurfaceHeight) !=
+                    (g_SwapchainExtent.width > g_SwapchainExtent.height);
+            if (rotated || orientationMismatch) {
+                width = g_SurfaceWidth;
+                height = g_SurfaceHeight;
+            }
+        } else if (transform == DisplayTransform::Rotate90 || transform == DisplayTransform::Rotate270) {
+            width = (int)g_SwapchainExtent.height;
+            height = (int)g_SwapchainExtent.width;
+        }
+
+        if (width <= 0 || height <= 0) {
+            width = (int)g_SwapchainExtent.width;
+            height = (int)g_SwapchainExtent.height;
+        }
+
+        if (g_DisplayWidth == width && g_DisplayHeight == height && g_TransformLogged)
+            return;
+
+        g_DisplayWidth = width;
+        g_DisplayHeight = height;
+        LOGI("Vulkan display geometry: logical=%dx%d framebuffer=%ux%u transform=%s preTransform=0x%x",
+             g_DisplayWidth, g_DisplayHeight,
+             g_SwapchainExtent.width, g_SwapchainExtent.height,
+             TransformName(transform), (unsigned)g_SwapchainTransform);
+        g_TransformLogged = true;
+    }
+
+    static ImVec2 TransformPointToFramebuffer(const ImVec2& p) {
+        const float lw = (float)std::max(1, g_DisplayWidth);
+        const float lh = (float)std::max(1, g_DisplayHeight);
+        const float fw = (float)std::max(1u, g_SwapchainExtent.width);
+        const float fh = (float)std::max(1u, g_SwapchainExtent.height);
+
+        switch (GetDisplayTransform()) {
+            case DisplayTransform::Rotate90:
+                return ImVec2((lh - p.y) * fw / lh, p.x * fh / lw);
+            case DisplayTransform::Rotate180:
+                return ImVec2((lw - p.x) * fw / lw, (lh - p.y) * fh / lh);
+            case DisplayTransform::Rotate270:
+                return ImVec2(p.y * fw / lh, (lw - p.x) * fh / lw);
+            default:
+                return ImVec2(p.x * fw / lw, p.y * fh / lh);
+        }
+    }
+
+    static void TransformClipRectToFramebuffer(ImVec4& rect) {
+        ImVec2 points[4] = {
+                TransformPointToFramebuffer(ImVec2(rect.x, rect.y)),
+                TransformPointToFramebuffer(ImVec2(rect.z, rect.y)),
+                TransformPointToFramebuffer(ImVec2(rect.z, rect.w)),
+                TransformPointToFramebuffer(ImVec2(rect.x, rect.w))
+        };
+
+        float minX = points[0].x;
+        float minY = points[0].y;
+        float maxX = points[0].x;
+        float maxY = points[0].y;
+        for (int i = 1; i < 4; ++i) {
+            minX = std::min(minX, points[i].x);
+            minY = std::min(minY, points[i].y);
+            maxX = std::max(maxX, points[i].x);
+            maxY = std::max(maxY, points[i].y);
+        }
+
+        rect = ImVec4(minX, minY, maxX, maxY);
+    }
+
+    static void PrepareDrawDataForFramebuffer(ImDrawData* drawData) {
+        if (!drawData || g_DisplayWidth <= 0 || g_DisplayHeight <= 0 ||
+            g_SwapchainExtent.width == 0 || g_SwapchainExtent.height == 0)
+            return;
+
+        const DisplayTransform transform = GetDisplayTransform();
+        const bool rotated = transform == DisplayTransform::Rotate90 ||
+                             transform == DisplayTransform::Rotate180 ||
+                             transform == DisplayTransform::Rotate270;
+        const bool scaled = g_DisplayWidth != (int)g_SwapchainExtent.width ||
+                            g_DisplayHeight != (int)g_SwapchainExtent.height;
+
+        if (!rotated && !scaled)
+            return;
+
+        for (int listIndex = 0; listIndex < drawData->CmdListsCount; ++listIndex) {
+            ImDrawList* drawList = drawData->CmdLists[listIndex];
+            for (int vertexIndex = 0; vertexIndex < drawList->VtxBuffer.Size; ++vertexIndex)
+                drawList->VtxBuffer[vertexIndex].pos =
+                        TransformPointToFramebuffer(drawList->VtxBuffer[vertexIndex].pos);
+
+            for (int cmdIndex = 0; cmdIndex < drawList->CmdBuffer.Size; ++cmdIndex)
+                TransformClipRectToFramebuffer(drawList->CmdBuffer[cmdIndex].ClipRect);
+        }
+
+        drawData->DisplayPos = ImVec2(0.0f, 0.0f);
+        drawData->DisplaySize = ImVec2((float)g_SwapchainExtent.width,
+                                       (float)g_SwapchainExtent.height);
+        drawData->FramebufferScale = ImVec2(1.0f, 1.0f);
+    }
 
     struct ScopedFlag {
         bool& value;
@@ -101,41 +260,47 @@ namespace Vulkan {
         ~ScopedFlag() { value = false; }
     };
 
+#define DRI_SET_ORIGINAL_IF_EMPTY(slot, value, type) \
+    do {                                             \
+        if (!(slot) && (value))                      \
+            (slot) = (type)(value);                  \
+    } while (0)
+
     static PFN_vkVoidFunction hook_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
         if (!pName) {
             return orig_vkGetDeviceProcAddr ? orig_vkGetDeviceProcAddr(device, pName) : nullptr;
         }
         PFN_vkVoidFunction real = orig_vkGetDeviceProcAddr ? orig_vkGetDeviceProcAddr(device, pName) : nullptr;
         if (strcmp(pName, "vkGetDeviceQueue") == 0) {
-            orig_vkGetDeviceQueue = (PFN_vkGetDeviceQueue)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkGetDeviceQueue, real, PFN_vkGetDeviceQueue);
             return (PFN_vkVoidFunction)hook_vkGetDeviceQueue;
         }
         if (strcmp(pName, "vkGetDeviceQueue2") == 0) {
-            orig_vkGetDeviceQueue2 = (PFN_vkGetDeviceQueue2)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkGetDeviceQueue2, real, PFN_vkGetDeviceQueue2);
             return (PFN_vkVoidFunction)hook_vkGetDeviceQueue2;
         }
         if (strcmp(pName, "vkCreateCommandPool") == 0) {
-            orig_vkCreateCommandPool = (PFN_vkCreateCommandPool)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateCommandPool, real, PFN_vkCreateCommandPool);
             return (PFN_vkVoidFunction)hook_vkCreateCommandPool;
         }
         if (strcmp(pName, "vkQueuePresentKHR") == 0) {
             LOGI("Game requested vkQueuePresentKHR via vkGetDeviceProcAddr -> returning our hook");
-            orig_vkQueuePresentKHR = (PFN_vkQueuePresentKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkQueuePresentKHR, real, PFN_vkQueuePresentKHR);
             return (PFN_vkVoidFunction)hook_vkQueuePresentKHR;
         }
         if (strcmp(pName, "vkAcquireNextImage2KHR") == 0) {
             LOGI("Game requested vkAcquireNextImage2KHR via vkGetDeviceProcAddr -> returning our hook");
-            orig_vkAcquireNextImage2KHR = (PFN_vkAcquireNextImage2KHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkAcquireNextImage2KHR, real, PFN_vkAcquireNextImage2KHR);
             return (PFN_vkVoidFunction)hook_vkAcquireNextImage2KHR;
         }
         if (strcmp(pName, "vkAcquireNextImageKHR") == 0) {
             LOGI("Game requested vkAcquireNextImageKHR via vkGetDeviceProcAddr -> returning our hook");
-            orig_vkAcquireNextImageKHR = (PFN_vkAcquireNextImageKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkAcquireNextImageKHR, real, PFN_vkAcquireNextImageKHR);
             return (PFN_vkVoidFunction)hook_vkAcquireNextImageKHR;
         }
         if (strcmp(pName, "vkCreateSwapchainKHR") == 0) {
             LOGI("Game requested vkCreateSwapchainKHR via vkGetDeviceProcAddr -> returning our hook");
-            orig_vkCreateSwapchainKHR = (PFN_vkCreateSwapchainKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateSwapchainKHR, real, PFN_vkCreateSwapchainKHR);
             return (PFN_vkVoidFunction)hook_vkCreateSwapchainKHR;
         }
         return real;
@@ -147,54 +312,54 @@ namespace Vulkan {
         }
         PFN_vkVoidFunction real = orig_vkGetInstanceProcAddr ? orig_vkGetInstanceProcAddr(instance, pName) : nullptr;
         if (strcmp(pName, "vkCreateInstance") == 0) {
-            orig_vkCreateInstance = (PFN_vkCreateInstance)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateInstance, real, PFN_vkCreateInstance);
             return (PFN_vkVoidFunction)hook_vkCreateInstance;
         }
         if (strcmp(pName, "vkCreateAndroidSurfaceKHR") == 0) {
             LOGI("Game requested vkCreateAndroidSurfaceKHR via vkGetInstanceProcAddr -> returning our hook");
-            orig_vkCreateAndroidSurfaceKHR = (PFN_vkCreateAndroidSurfaceKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateAndroidSurfaceKHR, real, PFN_vkCreateAndroidSurfaceKHR);
             return (PFN_vkVoidFunction)hook_vkCreateAndroidSurfaceKHR;
         }
         if (strcmp(pName, "vkCreateDevice") == 0) {
             LOGI("Game requested vkCreateDevice via vkGetInstanceProcAddr -> returning our hook");
-            orig_vkCreateDevice = (PFN_vkCreateDevice)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateDevice, real, PFN_vkCreateDevice);
             return (PFN_vkVoidFunction)hook_vkCreateDevice;
         }
         if (strcmp(pName, "vkGetDeviceQueue") == 0) {
-            orig_vkGetDeviceQueue = (PFN_vkGetDeviceQueue)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkGetDeviceQueue, real, PFN_vkGetDeviceQueue);
             return (PFN_vkVoidFunction)hook_vkGetDeviceQueue;
         }
         if (strcmp(pName, "vkGetDeviceQueue2") == 0) {
-            orig_vkGetDeviceQueue2 = (PFN_vkGetDeviceQueue2)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkGetDeviceQueue2, real, PFN_vkGetDeviceQueue2);
             return (PFN_vkVoidFunction)hook_vkGetDeviceQueue2;
         }
         if (strcmp(pName, "vkCreateCommandPool") == 0) {
-            orig_vkCreateCommandPool = (PFN_vkCreateCommandPool)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateCommandPool, real, PFN_vkCreateCommandPool);
             return (PFN_vkVoidFunction)hook_vkCreateCommandPool;
         }
         if (strcmp(pName, "vkCreateSwapchainKHR") == 0) {
             LOGI("Game requested vkCreateSwapchainKHR via vkGetInstanceProcAddr -> returning our hook");
-            orig_vkCreateSwapchainKHR = (PFN_vkCreateSwapchainKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateSwapchainKHR, real, PFN_vkCreateSwapchainKHR);
             return (PFN_vkVoidFunction)hook_vkCreateSwapchainKHR;
         }
         if (strcmp(pName, "vkAcquireNextImageKHR") == 0) {
             LOGI("Game requested vkAcquireNextImageKHR via vkGetInstanceProcAddr -> returning our hook");
-            orig_vkAcquireNextImageKHR = (PFN_vkAcquireNextImageKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkAcquireNextImageKHR, real, PFN_vkAcquireNextImageKHR);
             return (PFN_vkVoidFunction)hook_vkAcquireNextImageKHR;
         }
         if (strcmp(pName, "vkAcquireNextImage2KHR") == 0) {
             LOGI("Game requested vkAcquireNextImage2KHR via vkGetInstanceProcAddr -> returning our hook");
-            orig_vkAcquireNextImage2KHR = (PFN_vkAcquireNextImage2KHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkAcquireNextImage2KHR, real, PFN_vkAcquireNextImage2KHR);
             return (PFN_vkVoidFunction)hook_vkAcquireNextImage2KHR;
         }
         if (strcmp(pName, "vkQueuePresentKHR") == 0) {
             LOGI("Game requested vkQueuePresentKHR via vkGetInstanceProcAddr -> returning our hook");
-            orig_vkQueuePresentKHR = (PFN_vkQueuePresentKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkQueuePresentKHR, real, PFN_vkQueuePresentKHR);
             return (PFN_vkVoidFunction)hook_vkQueuePresentKHR;
         }
         if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
             LOGI("Game requested vkGetDeviceProcAddr via vkGetInstanceProcAddr -> returning our hook");
-            orig_vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkGetDeviceProcAddr, real, PFN_vkGetDeviceProcAddr);
             return (PFN_vkVoidFunction)hook_vkGetDeviceProcAddr;
         }
         return real;
@@ -314,6 +479,7 @@ namespace Vulkan {
         vkDeviceWaitIdle(g_Device);
         if (g_Initialized) {
             ImGui_ImplVulkan_Shutdown();
+            Renderer::Images::OnImGuiContextDestroyed();
             ImGui::DestroyContext();
             g_Initialized = false;
         }
@@ -467,10 +633,13 @@ namespace Vulkan {
 
         IMGUI_CHECKVERSION();
         ScopedFlag settingUp(g_SettingUpImGui);
+        UpdateDisplayGeometry();
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
-        io.DisplaySize = ImVec2((float)g_SwapchainExtent.width, (float)g_SwapchainExtent.height);
+        io.DisplaySize = ImVec2((float)g_DisplayWidth, (float)g_DisplayHeight);
+        io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
         io.IniFilename = nullptr;
+        Renderer::SetupImGuiFonts();
         ImGui::StyleColorsDark();
         ImGui::GetStyle().ScaleAllSizes(3.0f);
 
@@ -500,7 +669,8 @@ namespace Vulkan {
         // Font atlas is auto-created by ImGui_ImplVulkan_NewFrame() in v1.92+
 
         g_Initialized = true;
-        LOGI("=== ImGui Vulkan READY === %ux%u", g_SwapchainExtent.width, g_SwapchainExtent.height);
+        LOGI("=== ImGui Vulkan READY === logical=%dx%d framebuffer=%ux%u",
+             g_DisplayWidth, g_DisplayHeight, g_SwapchainExtent.width, g_SwapchainExtent.height);
         return true;
     }
 
@@ -522,6 +692,12 @@ namespace Vulkan {
     static VkResult hook_vkCreateInstance(const VkInstanceCreateInfo* ci,
                                            const VkAllocationCallbacks* a,
                                            VkInstance* instance) {
+        LOGI("vkCreateInstance called, dynamically re-scanning GOT tables for newly loaded libraries...");
+        HookLoadedLibraryGotSymbols((void*)hook_vkGetInstanceProcAddr,
+                                    (void**)&orig_vkGetInstanceProcAddr,
+                                    (void*)hook_vkGetDeviceProcAddr,
+                                    (void**)&orig_vkGetDeviceProcAddr);
+
         PFN_vkCreateInstance realCreate = orig_vkCreateInstance;
         if (!realCreate)
             realCreate = (PFN_vkCreateInstance)GetInstanceProc(nullptr, "vkCreateInstance");
@@ -549,8 +725,13 @@ namespace Vulkan {
         if (ci && ci->window) {
             int width = ANativeWindow_getWidth(ci->window);
             int height = ANativeWindow_getHeight(ci->window);
+            g_SurfaceWidth = width;
+            g_SurfaceHeight = height;
+            g_TransformLogged = false;
             Renderer::SetInputSurfaceSize(width, height);
             LOGI("vkCreateAndroidSurfaceKHR window=%p size=%dx%d", ci->window, width, height);
+            if (g_SwapchainExtent.width > 0 && g_SwapchainExtent.height > 0)
+                UpdateDisplayGeometry();
         }
 
         return realFunc(instance, ci, a, surface);
@@ -665,12 +846,16 @@ namespace Vulkan {
             g_Swapchain = *sc;
             g_SwapchainFormat = ci->imageFormat;
             g_SwapchainExtent = ci->imageExtent;
+            g_SwapchainTransform = ci->preTransform;
+            g_TransformLogged = false;
+            UpdateDisplayGeometry();
             uint32_t cnt = 0;
             vkGetSwapchainImagesKHR(dev, g_Swapchain, &cnt, nullptr);
             g_SwapchainImages.resize(cnt);
             vkGetSwapchainImagesKHR(dev, g_Swapchain, &cnt, g_SwapchainImages.data());
-            LOGI("vkCreateSwapchainKHR: fmt=%d %ux%u imgs=%u",
-                 g_SwapchainFormat, g_SwapchainExtent.width, g_SwapchainExtent.height, cnt);
+            LOGI("vkCreateSwapchainKHR: fmt=%d %ux%u imgs=%u preTransform=0x%x",
+                 g_SwapchainFormat, g_SwapchainExtent.width, g_SwapchainExtent.height,
+                 cnt, (unsigned)g_SwapchainTransform);
             TrySetupImGui();
         }
         return r;
@@ -704,6 +889,11 @@ namespace Vulkan {
     }
 
     static VkResult hook_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pi) {
+        // Track heartbeat if active or none claimed yet
+        if (Renderer::GetActiveAPI() == API::NONE || Renderer::GetActiveAPI() == API::VULKAN) {
+            Renderer::OnFrameRendered(API::VULKAN);
+        }
+
         PFN_vkQueuePresentKHR realFunc = orig_vkQueuePresentKHR;
         if (!realFunc && g_Device)
             realFunc = (PFN_vkQueuePresentKHR)GetDeviceProc(g_Device, "vkQueuePresentKHR");
@@ -741,8 +931,10 @@ namespace Vulkan {
             g_CurrentImageIndex < g_Framebuffers.size() &&
             g_CurrentImageIndex < g_RenderCompleteSemaphores.size()) {
             uint32_t imageIndex = g_CurrentImageIndex;
+            UpdateDisplayGeometry();
             ImGuiIO& io = ImGui::GetIO();
-            io.DisplaySize = ImVec2((float)g_SwapchainExtent.width, (float)g_SwapchainExtent.height);
+            io.DisplaySize = ImVec2((float)g_DisplayWidth, (float)g_DisplayHeight);
+            io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
 
             vkWaitForFences(g_Device, 1, &g_Fences[imageIndex], VK_TRUE, UINT64_MAX);
             vkResetFences(g_Device, 1, &g_Fences[imageIndex]);
@@ -783,9 +975,13 @@ namespace Vulkan {
             Renderer::DrainInputEvents();
             ImGui::NewFrame();
             if (g_DrawCallback) g_DrawCallback();
+            Renderer::UpdateInputCaptureState();
             ImGui::EndFrame();
             ImGui::Render();
-            ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+            ImDrawData* drawData = ImGui::GetDrawData();
+            PrepareDrawDataForFramebuffer(drawData);
+            ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
+            Renderer::Images::UpdateLifecycle();
 
             vkCmdEndRenderPass(cmd);
             vkEndCommandBuffer(cmd);
@@ -820,7 +1016,7 @@ namespace Vulkan {
     }
 
     static bool HookSymbol(void* handle, const char* name, void* replacement, void** original) {
-        void* addr = dlsym(handle, name);
+        void* addr = orig_dlsym ? orig_dlsym(handle, name) : dlsym(handle, name);
         if (!addr) {
             LOGE("%s not exported by libvulkan.so", name);
             return false;
@@ -841,60 +1037,69 @@ namespace Vulkan {
         if (!symbol || !real)
             return real;
 
+        // If Vulkan symbols are requested, scan/re-scan GOT tables to patch newly loaded libraries like libUnreal.so or libunity.so
+        if (symbol[0] == 'v' && symbol[1] == 'k') {
+            LOGI("dlsym requested %s, dynamically re-scanning GOT tables for new libraries...", symbol);
+            HookLoadedLibraryGotSymbols((void*)hook_vkGetInstanceProcAddr,
+                                        (void**)&orig_vkGetInstanceProcAddr,
+                                        (void*)hook_vkGetDeviceProcAddr,
+                                        (void**)&orig_vkGetDeviceProcAddr);
+        }
+
         if (strcmp(symbol, "vkGetInstanceProcAddr") == 0) {
-            orig_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkGetInstanceProcAddr, real, PFN_vkGetInstanceProcAddr);
             LOGI("dlsym intercepted vkGetInstanceProcAddr -> returning hook");
             return (void*)hook_vkGetInstanceProcAddr;
         }
         if (strcmp(symbol, "vkGetDeviceProcAddr") == 0) {
-            orig_vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkGetDeviceProcAddr, real, PFN_vkGetDeviceProcAddr);
             LOGI("dlsym intercepted vkGetDeviceProcAddr -> returning hook");
             return (void*)hook_vkGetDeviceProcAddr;
         }
         if (strcmp(symbol, "vkCreateInstance") == 0) {
-            orig_vkCreateInstance = (PFN_vkCreateInstance)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateInstance, real, PFN_vkCreateInstance);
             LOGI("dlsym intercepted vkCreateInstance -> returning hook");
             return (void*)hook_vkCreateInstance;
         }
         if (strcmp(symbol, "vkCreateAndroidSurfaceKHR") == 0) {
-            orig_vkCreateAndroidSurfaceKHR = (PFN_vkCreateAndroidSurfaceKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateAndroidSurfaceKHR, real, PFN_vkCreateAndroidSurfaceKHR);
             LOGI("dlsym intercepted vkCreateAndroidSurfaceKHR -> returning hook");
             return (void*)hook_vkCreateAndroidSurfaceKHR;
         }
         if (strcmp(symbol, "vkCreateDevice") == 0) {
-            orig_vkCreateDevice = (PFN_vkCreateDevice)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateDevice, real, PFN_vkCreateDevice);
             LOGI("dlsym intercepted vkCreateDevice -> returning hook");
             return (void*)hook_vkCreateDevice;
         }
         if (strcmp(symbol, "vkGetDeviceQueue") == 0) {
-            orig_vkGetDeviceQueue = (PFN_vkGetDeviceQueue)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkGetDeviceQueue, real, PFN_vkGetDeviceQueue);
             return (void*)hook_vkGetDeviceQueue;
         }
         if (strcmp(symbol, "vkGetDeviceQueue2") == 0) {
-            orig_vkGetDeviceQueue2 = (PFN_vkGetDeviceQueue2)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkGetDeviceQueue2, real, PFN_vkGetDeviceQueue2);
             return (void*)hook_vkGetDeviceQueue2;
         }
         if (strcmp(symbol, "vkCreateCommandPool") == 0) {
-            orig_vkCreateCommandPool = (PFN_vkCreateCommandPool)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateCommandPool, real, PFN_vkCreateCommandPool);
             return (void*)hook_vkCreateCommandPool;
         }
         if (strcmp(symbol, "vkCreateSwapchainKHR") == 0) {
-            orig_vkCreateSwapchainKHR = (PFN_vkCreateSwapchainKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkCreateSwapchainKHR, real, PFN_vkCreateSwapchainKHR);
             LOGI("dlsym intercepted vkCreateSwapchainKHR -> returning hook");
             return (void*)hook_vkCreateSwapchainKHR;
         }
         if (strcmp(symbol, "vkAcquireNextImageKHR") == 0) {
-            orig_vkAcquireNextImageKHR = (PFN_vkAcquireNextImageKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkAcquireNextImageKHR, real, PFN_vkAcquireNextImageKHR);
             LOGI("dlsym intercepted vkAcquireNextImageKHR -> returning hook");
             return (void*)hook_vkAcquireNextImageKHR;
         }
         if (strcmp(symbol, "vkAcquireNextImage2KHR") == 0) {
-            orig_vkAcquireNextImage2KHR = (PFN_vkAcquireNextImage2KHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkAcquireNextImage2KHR, real, PFN_vkAcquireNextImage2KHR);
             LOGI("dlsym intercepted vkAcquireNextImage2KHR -> returning hook");
             return (void*)hook_vkAcquireNextImage2KHR;
         }
         if (strcmp(symbol, "vkQueuePresentKHR") == 0) {
-            orig_vkQueuePresentKHR = (PFN_vkQueuePresentKHR)real;
+            DRI_SET_ORIGINAL_IF_EMPTY(orig_vkQueuePresentKHR, real, PFN_vkQueuePresentKHR);
             LOGI("dlsym intercepted vkQueuePresentKHR -> returning hook");
             return (void*)hook_vkQueuePresentKHR;
         }
@@ -935,6 +1140,12 @@ namespace Vulkan {
         bool hooked;
     };
 
+#ifdef __LP64__
+#define DRI_R_SYM(info) ELF64_R_SYM(info)
+#else
+#define DRI_R_SYM(info) ELF32_R_SYM(info)
+#endif
+
     static uintptr_t DynamicPtrToAddress(const dl_phdr_info* info, ElfW(Addr) ptr) {
         if (ptr == 0)
             return 0;
@@ -969,7 +1180,7 @@ namespace Vulkan {
 
     static bool PatchGotSlot(void** slot, void* replacement, void** original) {
         if (!slot || *slot == replacement)
-            return true;
+            return false;
 
         if (original && !*original)
             *original = *slot;
@@ -994,14 +1205,30 @@ namespace Vulkan {
         return true;
     }
 
+    static bool IsAppLibraryForGotHook(const char* imageName) {
+        if (!imageName || imageName[0] == '\0')
+            return false;
+        if (strstr(imageName, "libmenu.so"))
+            return false;
+        if (strstr(imageName, "/data/app/") ||
+            strstr(imageName, "/data/user/") ||
+            strstr(imageName, "/data/data/") ||
+            strstr(imageName, "/mnt/expand/")) {
+            return true;
+        }
+        return false;
+    }
+
     static bool TryPatchRelaTable(const dl_phdr_info* info, GotHookRequest* request,
+                                  const char* imageName,
                                   ElfW(Rela)* rela, size_t relaCount,
                                   ElfW(Sym)* symtab, const char* strtab) {
         if (!rela || !symtab || !strtab)
             return false;
 
+        bool patchedAny = false;
         for (size_t i = 0; i < relaCount; i++) {
-            size_t symIndex = ELF64_R_SYM(rela[i].r_info);
+            size_t symIndex = DRI_R_SYM(rela[i].r_info);
             if (symIndex == 0)
                 continue;
 
@@ -1011,21 +1238,54 @@ namespace Vulkan {
 
             void** slot = (void**)((uintptr_t)info->dlpi_addr + (uintptr_t)rela[i].r_offset);
             if (PatchGotSlot(slot, request->replacement, request->original)) {
-                LOGI("GOT hooked %s!%s at %p", request->image, request->symbol, slot);
+                LOGI("GOT (RELA) hooked %s!%s at %p", imageName, request->symbol, slot);
                 request->hooked = true;
-                return true;
+                patchedAny = true;
             }
-            return false;
         }
 
-        return false;
+        return patchedAny;
+    }
+
+    static bool TryPatchRelTable(const dl_phdr_info* info, GotHookRequest* request,
+                                 const char* imageName,
+                                 ElfW(Rel)* rel, size_t relCount,
+                                 ElfW(Sym)* symtab, const char* strtab) {
+        if (!rel || !symtab || !strtab)
+            return false;
+
+        bool patchedAny = false;
+        for (size_t i = 0; i < relCount; i++) {
+            size_t symIndex = DRI_R_SYM(rel[i].r_info);
+            if (symIndex == 0)
+                continue;
+
+            const char* name = strtab + symtab[symIndex].st_name;
+            if (strcmp(name, request->symbol) != 0)
+                continue;
+
+            void** slot = (void**)((uintptr_t)info->dlpi_addr + (uintptr_t)rel[i].r_offset);
+            if (PatchGotSlot(slot, request->replacement, request->original)) {
+                LOGI("GOT (REL) hooked %s!%s at %p", imageName, request->symbol, slot);
+                request->hooked = true;
+                patchedAny = true;
+            }
+        }
+
+        return patchedAny;
     }
 
     static int GotHookPhdrCallback(dl_phdr_info* info, size_t, void* data) {
         auto* request = (GotHookRequest*)data;
         const char* imageName = info->dlpi_name ? info->dlpi_name : "";
-        if (strstr(imageName, request->image) == nullptr)
-            return 0;
+        if (request->image && request->image[0] != '\0') {
+            if (strstr(imageName, request->image) == nullptr)
+                return 0;
+        } else {
+            if (!IsAppLibraryForGotHook(imageName)) {
+                return 0;
+            }
+        }
 
         ElfW(Dyn)* dynamic = nullptr;
         for (ElfW(Half) i = 0; i < info->dlpi_phnum; i++) {
@@ -1041,10 +1301,13 @@ namespace Vulkan {
 
         ElfW(Sym)* symtab = nullptr;
         const char* strtab = nullptr;
-        ElfW(Rela)* jmprel = nullptr;
+        void* jmprel = nullptr;
         size_t jmprelSize = 0;
+        uintptr_t pltrelFormat = DT_RELA;
         ElfW(Rela)* rela = nullptr;
         size_t relaSize = 0;
+        ElfW(Rel)* rel = nullptr;
+        size_t relSize = 0;
 
         for (ElfW(Dyn)* dyn = dynamic; dyn->d_tag != DT_NULL; dyn++) {
             switch (dyn->d_tag) {
@@ -1055,10 +1318,13 @@ namespace Vulkan {
                     strtab = (const char*)DynamicPtrToAddress(info, dyn->d_un.d_ptr);
                     break;
                 case DT_JMPREL:
-                    jmprel = (ElfW(Rela)*)DynamicPtrToAddress(info, dyn->d_un.d_ptr);
+                    jmprel = (void*)DynamicPtrToAddress(info, dyn->d_un.d_ptr);
                     break;
                 case DT_PLTRELSZ:
                     jmprelSize = dyn->d_un.d_val;
+                    break;
+                case DT_PLTREL:
+                    pltrelFormat = dyn->d_un.d_val;
                     break;
                 case DT_RELA:
                     rela = (ElfW(Rela)*)DynamicPtrToAddress(info, dyn->d_un.d_ptr);
@@ -1066,27 +1332,94 @@ namespace Vulkan {
                 case DT_RELASZ:
                     relaSize = dyn->d_un.d_val;
                     break;
+                case DT_REL:
+                    rel = (ElfW(Rel)*)DynamicPtrToAddress(info, dyn->d_un.d_ptr);
+                    break;
+                case DT_RELSZ:
+                    relSize = dyn->d_un.d_val;
+                    break;
                 default:
                     break;
             }
         }
 
-        size_t jmprelCount = jmprelSize / sizeof(ElfW(Rela));
-        if (TryPatchRelaTable(info, request, jmprel, jmprelCount, symtab, strtab))
-            return 1;
+        if (jmprel && jmprelSize > 0) {
+            if (pltrelFormat == DT_REL) {
+                size_t jmprelCount = jmprelSize / sizeof(ElfW(Rel));
+                TryPatchRelTable(info, request, imageName, (ElfW(Rel)*)jmprel, jmprelCount, symtab, strtab);
+            } else {
+                size_t jmprelCount = jmprelSize / sizeof(ElfW(Rela));
+                TryPatchRelaTable(info, request, imageName, (ElfW(Rela)*)jmprel, jmprelCount, symtab, strtab);
+            }
+        }
 
-        size_t relaCount = relaSize / sizeof(ElfW(Rela));
-        if (TryPatchRelaTable(info, request, rela, relaCount, symtab, strtab))
-            return 1;
+        if (rela && relaSize > 0) {
+            size_t relaCount = relaSize / sizeof(ElfW(Rela));
+            TryPatchRelaTable(info, request, imageName, rela, relaCount, symtab, strtab);
+        }
 
-        LOGE("Could not find GOT slot %s!%s", request->image, request->symbol);
-        return 1;
+        if (rel && relSize > 0) {
+            size_t relCount = relSize / sizeof(ElfW(Rel));
+            TryPatchRelTable(info, request, imageName, rel, relCount, symtab, strtab);
+        }
+
+        return 0;
     }
 
     static bool HookGotSymbol(const char* image, const char* symbol, void* replacement, void** original) {
         GotHookRequest request{image, symbol, replacement, original, false};
         dl_iterate_phdr(GotHookPhdrCallback, &request);
         return request.hooked;
+    }
+
+    static int HookLoadedLibraryGotSymbols(void* replacementGipa, void** originalGipa,
+                                           void* replacementGdpa, void** originalGdpa) {
+        int hooked = 0;
+        if (HookGotSymbol("", "vkGetInstanceProcAddr", replacementGipa, originalGipa))
+            hooked++;
+        if (HookGotSymbol("", "vkGetDeviceProcAddr", replacementGdpa, originalGdpa))
+            hooked++;
+        if (HookGotSymbol("", "vkCreateInstance",
+                          (void*)hook_vkCreateInstance,
+                          (void**)&orig_vkCreateInstance))
+            hooked++;
+        if (HookGotSymbol("", "vkCreateAndroidSurfaceKHR",
+                          (void*)hook_vkCreateAndroidSurfaceKHR,
+                          (void**)&orig_vkCreateAndroidSurfaceKHR))
+            hooked++;
+        if (HookGotSymbol("", "vkCreateDevice",
+                          (void*)hook_vkCreateDevice,
+                          (void**)&orig_vkCreateDevice))
+            hooked++;
+        if (HookGotSymbol("", "vkGetDeviceQueue",
+                          (void*)hook_vkGetDeviceQueue,
+                          (void**)&orig_vkGetDeviceQueue))
+            hooked++;
+        if (HookGotSymbol("", "vkGetDeviceQueue2",
+                          (void*)hook_vkGetDeviceQueue2,
+                          (void**)&orig_vkGetDeviceQueue2))
+            hooked++;
+        if (HookGotSymbol("", "vkCreateCommandPool",
+                          (void*)hook_vkCreateCommandPool,
+                          (void**)&orig_vkCreateCommandPool))
+            hooked++;
+        if (HookGotSymbol("", "vkCreateSwapchainKHR",
+                          (void*)hook_vkCreateSwapchainKHR,
+                          (void**)&orig_vkCreateSwapchainKHR))
+            hooked++;
+        if (HookGotSymbol("", "vkAcquireNextImageKHR",
+                          (void*)hook_vkAcquireNextImageKHR,
+                          (void**)&orig_vkAcquireNextImageKHR))
+            hooked++;
+        if (HookGotSymbol("", "vkAcquireNextImage2KHR",
+                          (void*)hook_vkAcquireNextImage2KHR,
+                          (void**)&orig_vkAcquireNextImage2KHR))
+            hooked++;
+        if (HookGotSymbol("", "vkQueuePresentKHR",
+                          (void*)hook_vkQueuePresentKHR,
+                          (void**)&orig_vkQueuePresentKHR))
+            hooked++;
+        return hooked;
     }
 
     static bool InstallVulkanHooks(void* vkHandle) {
@@ -1111,12 +1444,10 @@ namespace Vulkan {
 
         int ok = 0;
         ok += InstallDlsymHook() ? 1 : 0;
-        ok += HookGotSymbol("libUE4.so", "vkGetInstanceProcAddr",
-                            (void*)hook_vkGetInstanceProcAddr,
-                            (void**)&orig_vkGetInstanceProcAddr) ? 1 : 0;
-        ok += HookGotSymbol("libUE4.so", "vkGetDeviceProcAddr",
-                            (void*)hook_vkGetDeviceProcAddr,
-                            (void**)&orig_vkGetDeviceProcAddr) ? 1 : 0;
+        ok += HookLoadedLibraryGotSymbols((void*)hook_vkGetInstanceProcAddr,
+                                          (void**)&orig_vkGetInstanceProcAddr,
+                                          (void*)hook_vkGetDeviceProcAddr,
+                                          (void**)&orig_vkGetDeviceProcAddr);
 
         if (ok > 0) {
             g_HooksInstalled.store(true);
@@ -1136,13 +1467,13 @@ namespace Vulkan {
             for (int i = 0; i < 300 && !g_HooksInstalled.load(); i++) {
                 void* vkHandle = GetVulkanHandle(false);
                 if (vkHandle && InstallVulkanHooks(vkHandle)) {
-                    LOGI("Vulkan UE4 hooks installed after waiting for libraries");
+                    LOGI("Vulkan hooks installed after waiting for libraries");
                     return;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             if (!g_HooksInstalled.load())
-                LOGE("Timed out waiting for libvulkan.so/libUE4.so Vulkan imports");
+                LOGE("Timed out waiting for libvulkan.so or Vulkan imports");
         }).detach();
     }
 
@@ -1151,7 +1482,7 @@ namespace Vulkan {
         if (vkHandle) {
             if (InstallVulkanHooks(vkHandle))
                 return true;
-            LOGI("Vulkan loaded, but UE4 imports are not ready yet; waiting in background");
+            LOGI("Vulkan loaded, but Vulkan imports are not ready yet; waiting in background");
             StartVulkanWaitThread();
             return true;
         }
@@ -1165,6 +1496,7 @@ namespace Vulkan {
         if (g_Initialized) {
             vkDeviceWaitIdle(g_Device);
             ImGui_ImplVulkan_Shutdown();
+            Renderer::Images::OnImGuiContextDestroyed();
             ImGui::DestroyContext();
             g_Initialized = false;
         }
@@ -1183,11 +1515,27 @@ namespace Vulkan {
         g_Queue = VK_NULL_HANDLE;
         g_HasQueueFamily = false;
         g_Swapchain = VK_NULL_HANDLE;
+        g_SwapchainExtent = {0, 0};
+        g_SwapchainTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        g_SurfaceWidth = 0;
+        g_SurfaceHeight = 0;
+        g_DisplayWidth = 0;
+        g_DisplayHeight = 0;
+        g_TransformLogged = false;
     }
 
     void SetDrawCallback(DrawCallback cb) { g_DrawCallback = cb; }
-    int GetScreenWidth() { return (int)g_SwapchainExtent.width; }
-    int GetScreenHeight() { return (int)g_SwapchainExtent.height; }
+    int GetScreenWidth() {
+        if (g_DisplayWidth <= 0)
+            UpdateDisplayGeometry();
+        return g_DisplayWidth > 0 ? g_DisplayWidth : (int)g_SwapchainExtent.width;
+    }
+
+    int GetScreenHeight() {
+        if (g_DisplayHeight <= 0)
+            UpdateDisplayGeometry();
+        return g_DisplayHeight > 0 ? g_DisplayHeight : (int)g_SwapchainExtent.height;
+    }
 
     void HandleTouch(int action, float x, float y) {
         if (!g_Initialized) return;
